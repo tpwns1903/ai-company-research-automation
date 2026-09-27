@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # ── API 키 ─────────────────────────────────────────────────
     dart_api_key: str = Field(..., description="DART OpenAPI 인증 키")
     openai_api_key: str = Field(default="", description="OpenAI API 키 (LLM 리포트 생성)")
+    gemini_api_key: str = Field(default="", description="Google Gemini API 키 (LLM 리포트 생성)")
     naver_client_id: str = Field(default="", description="네이버 검색 API Client ID")
     naver_client_secret: str = Field(default="", description="네이버 검색 API Client Secret")
     news_api_key: str = Field(default="", description="뉴스 API 키 (더 더이상 사용 안함, 유지됨)")
@@ -90,11 +91,21 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", description="로그 레벨 (DEBUG/INFO/WARNING/ERROR)")
 
     # ── LLM 설정 ───────────────────────────────────────────────
+    llm_provider: str = Field(
+        default="auto",
+        description="LLM 제공자 (auto / openai / gemini). "
+        "auto는 OPENAI_API_KEY → GEMINI_API_KEY 순으로 설정된 키를 사용한다.",
+    )
     llm_model: str = Field(
-        default="gpt-4o", description="사용할 LLM 모델명"
+        default="", description="사용할 LLM 모델명 (비우면 제공자별 기본 모델)"
+    )
+    llm_reasoning_effort: str = Field(
+        default="",
+        description="추론 모델의 추론 강도 (low / medium / high). 비우면 전송하지 않는다.",
     )
     llm_max_tokens: int = Field(
-        default=4096, description="LLM 최대 토큰 수"
+        default=8192,
+        description="LLM 최대 토큰 수 (추론 모델은 내부 추론 토큰도 이 한도를 함께 쓴다)",
     )
     llm_temperature: float = Field(
         default=0.3, description="LLM 온도 파라미터 (낮을수록 일관성 높음)"
@@ -105,6 +116,26 @@ class Settings(BaseSettings):
         default_factory=lambda: [],
         description="수집 대상 텔레그램 공개 채널 목록 (예: ['@channel1'])",
     )
+
+
+_PLACEHOLDER_MARKERS = ("your_", "_here", "<", "changeme")
+
+
+def is_configured_key(value: str | None) -> bool:
+    """API 키가 실제 값으로 설정되었는지 확인한다.
+
+    빈 문자열이나 .env.example의 예시 문구(예: 'your_openai_api_key_here')는
+    설정되지 않은 것으로 본다.
+
+    Args:
+        value: 확인할 API 키 문자열.
+
+    Returns:
+        bool: 실제 키로 보이면 True.
+    """
+    if not value or not value.strip():
+        return False
+    return not any(marker in value for marker in _PLACEHOLDER_MARKERS)
 
 
 def get_settings() -> Settings:

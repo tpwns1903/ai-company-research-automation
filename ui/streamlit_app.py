@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.config import configure_logging, get_settings
+from llm.report_generator import resolve_llm_backend
 from main import run_pipeline
 from utils.formatters import format_confidence_10, format_won_uk
 
@@ -51,7 +52,11 @@ def render_sidebar() -> tuple[str, bool, bool]:
         export_pdf = st.checkbox("PDF 리포트 생성", value=True)
         
         st.markdown("---")
-        st.caption(f"LLM 모델: `{st.session_state.settings.llm_model}`")
+        backend = resolve_llm_backend(st.session_state.settings)
+        if backend.provider:
+            st.caption(f"LLM: `{backend.provider} / {backend.model}`")
+        else:
+            st.caption(f"LLM: Fallback 모드 ({backend.unavailable_reason})")
         st.caption(f"캐시 기간: `{st.session_state.settings.cache_ttl_seconds}`초")
         
     return company_name.strip(), export_excel, export_pdf

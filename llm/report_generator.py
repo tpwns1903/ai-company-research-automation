@@ -2,27 +2,32 @@
 report_generator.py
 LLM 기반 Markdown 리포트 생성기
 
-ResearchResult(JSON)를 받아 OpenAI API(또는 호환 LLM)를 통해
+ResearchResult(JSON)를 받아 OpenAI 또는 Google Gemini API를 통해
 투자자 관점의 Markdown 리포트를 생성한다.
 
 특징:
   - API 키는 config.py/Settings에서만 로드 (하드코딩 금지)
+  - LLM_PROVIDER(auto / openai / gemini)로 제공자 선택
+    Gemini는 OpenAI 호환 엔드포인트를 사용하므로 openai 패키지 하나로 두 제공자를 호출한다.
   - 재시도 로직 내장 (max_retry_attempts 설정 준수)
-  - LLM API 실패 시 앱 전체가 죽지 않도록 에러 메시지 반환
+    인증/권한/모델 없음/잘못된 요청/쿼터 소진처럼 재시도해도 같은 에러는 즉시 중단
+  - LLM API 실패 시 앱 전체가 죽지 않도록 Fallback 리포트 + 실패 원인 반환
   - 증권사 리포트 0건이어도 재무/뉴스로 리포트 생성 + 사실 명시
-  - API 키 미설정 시 Fallback: 프롬프트 기반 로컬 리포트 자동 생성
+  - API 키 미설정(예시 문구 포함) 시 Fallback: 수집 데이터 기반 로컬 리포트 자동 생성
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from config.config import Settings, get_settings
+from config.config import Settings, get_settings, is_configured_key
 from llm.prompts.analysis_prompt import (
     SYSTEM_PROMPT,
     build_analysis_prompt,
@@ -34,6 +39,89 @@ logger = logging.getLogger(__name__)
 
 _KST = ZoneInfo("Asia/Seoul")
 
+# 제공자별 접속 정보와 기본 모델
+_PROVIDERS: dict[str, dict[str, Optional[str]]] = {
+    "openai": {
+        "key_env": "OPENAI_API_KEY",
+        "base_url": None,
+        "default_model": "gpt-4o",
+    },
+    "gemini": {
+        "key_env": "GEMINI_API_KEY",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "default_model": "gemini-3.8-flash",
+    },
+}
+
+# LLM 요청 1회 타임아웃 (초). 추론 모델은 긴 리포트 생성에 수 분이 걸릴 수 있다.
+_REQUEST_TIMEOUT_SECONDS = 300.0
+
+# 에러 메시지에 섞여 들어올 수 있는 API 키 형태
+_KEY_PATTERN = re.compile(r"(sk-|AIza)[A-Za-z0-9_\-*.]{6,}")
+
+
+@dataclass(frozen=True)
+class LLMBackend:
+    """설정에서 결정된 LLM 호출 대상. provider가 None이면 Fallback 모드."""
+
+    provider: Optional[str]
+    model: str
+    api_key: str = ""
+    base_url: Optional[str] = None
+    unavailable_reason: str = ""
+
+
+def resolve_llm_backend(settings: Settings) -> LLMBackend:
+    """LLM_PROVIDER와 API 키 설정으로 사용할 제공자·모델을 결정한다.
+
+    - openai / gemini: 해당 제공자의 키가 설정되어 있어야 한다.
+    - auto: OPENAI_API_KEY → GEMINI_API_KEY 순으로 설정된 키를 사용한다.
+    - 빈 값이나 .env.example의 예시 문구 키는 설정되지 않은 것으로 본다.
+
+    Args:
+        settings: 애플리케이션 설정.
+
+    Returns:
+        LLMBackend: 호출 대상. 사용할 수 없으면 provider=None과 사유.
+    """
+    keys = {"openai": settings.openai_api_key, "gemini": settings.gemini_api_key}
+    requested = (settings.llm_provider or "auto").strip().lower()
+
+    if requested == "auto":
+        provider = next((p for p in ("openai", "gemini") if is_configured_key(keys[p])), None)
+        if provider is None:
+            return LLMBackend(
+                provider=None, model="",
+                unavailable_reason="LLM API 키 미설정 (OPENAI_API_KEY 또는 GEMINI_API_KEY 필요)",
+            )
+    elif requested in _PROVIDERS:
+        provider = requested
+        if not is_configured_key(keys[provider]):
+            return LLMBackend(
+                provider=None, model="",
+                unavailable_reason=(
+                    f"LLM_PROVIDER={provider} 이지만 {_PROVIDERS[provider]['key_env']}가 "
+                    "설정되지 않았습니다"
+                ),
+            )
+    else:
+        return LLMBackend(
+            provider=None, model="",
+            unavailable_reason=f"알 수 없는 LLM_PROVIDER 값: '{settings.llm_provider}' (auto / openai / gemini)",
+        )
+
+    info = _PROVIDERS[provider]
+    return LLMBackend(
+        provider=provider,
+        model=settings.llm_model.strip() or str(info["default_model"]),
+        api_key=keys[provider].strip(),
+        base_url=info["base_url"],
+    )
+
+
+class LLMCallError(RuntimeError):
+    """LLM 호출 최종 실패. 메시지에 사람이 읽을 수 있는 실패 원인을 담는다."""
+
 
 class ReportGenerator:
     """ResearchResult를 입력받아 LLM으로 Markdown 리포트를 생성하는 클래스.
@@ -42,12 +130,14 @@ class ReportGenerator:
     출력 : Markdown 형식의 기업 분석 리포트 문자열
 
     LLM 백엔드:
-        - OpenAI API (기본): openai 패키지 사용. config.openai_api_key 필요.
-        - API 키 미설정 시: 수집된 데이터를 구조화하여 Fallback Markdown 리포트 반환.
+        - LLM_PROVIDER=auto(기본) / openai / gemini 로 선택 (resolve_llm_backend 참고).
+        - Gemini는 OpenAI 호환 엔드포인트로 호출하므로 openai 패키지만 있으면 된다.
+        - 사용 가능한 키가 없으면: 수집된 데이터를 구조화하여 Fallback Markdown 리포트 반환.
 
     재시도 로직:
-        - LLM 호출 실패 시 settings.max_retry_attempts 횟수만큼 재시도.
+        - 일시적 오류(5xx, 속도 제한, 네트워크, 빈 응답)는 settings.max_retry_attempts 횟수만큼 재시도.
         - 재시도 간 settings.retry_delay_seconds × attempt 초 대기 (지수 백오프).
+        - 인증/권한/모델 없음/잘못된 요청/쿼터 소진은 재시도하지 않고 즉시 실패 처리.
     """
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
@@ -57,40 +147,54 @@ class ReportGenerator:
             settings: 애플리케이션 설정. None이면 .env에서 자동 로드.
         """
         self._settings: Settings = settings or get_settings()
-        self._api_key: str = self._settings.openai_api_key
-        self._model: str = self._settings.llm_model
+        self._backend: LLMBackend = resolve_llm_backend(self._settings)
+        self._model: str = self._backend.model
         self._max_tokens: int = self._settings.llm_max_tokens
         self._temperature: float = self._settings.llm_temperature
+        self._reasoning_effort: str = self._settings.llm_reasoning_effort.strip()
 
-        self._use_llm: bool = bool(self._api_key)
+        self._unavailable_reason: str = self._backend.unavailable_reason
         self._client: Optional[Any] = None
 
-        if self._use_llm:
-            self._client = self._init_openai_client()
-        else:
+        if self._backend.provider:
+            self._client = self._init_client()
+        if self._client is None:
             logger.info(
-                "[ReportGenerator] OPENAI_API_KEY 미설정 - Fallback 리포트 생성 모드로 동작합니다."
+                "[ReportGenerator] %s - Fallback 리포트 생성 모드로 동작합니다.",
+                self._unavailable_reason,
             )
 
         logger.debug(
-            "ReportGenerator 초기화 완료 (모델: %s, LLM사용: %s)",
-            self._model, self._use_llm,
+            "ReportGenerator 초기화 완료 (제공자: %s, 모델: %s, LLM사용: %s)",
+            self._backend.provider, self._model, self._client is not None,
         )
 
-    def _init_openai_client(self) -> Optional[Any]:
-        """OpenAI 클라이언트를 초기화한다."""
+    @property
+    def engine_label(self) -> str:
+        """UI/로그 표시용 'provider / model' 문자열. LLM 미사용 시 Fallback 사유."""
+        if self._client is None:
+            return f"Fallback ({self._unavailable_reason})"
+        return f"{self._backend.provider} / {self._model}"
+
+    def _init_client(self) -> Optional[Any]:
+        """선택된 제공자의 OpenAI 호환 클라이언트를 초기화한다."""
         try:
             from openai import OpenAI  # type: ignore[import]
-            client = OpenAI(api_key=self._api_key)
-            logger.debug("OpenAI 클라이언트 초기화 완료")
-            return client
         except ImportError:
-            logger.warning(
-                "openai 패키지가 설치되지 않았습니다. 'pip install openai'를 실행하세요. "
-                "Fallback 모드로 동작합니다."
-            )
-            self._use_llm = False
+            self._unavailable_reason = "openai 패키지 미설치 ('pip install openai' 필요)"
             return None
+        # 재시도는 _call_llm_with_retry가 담당하므로 SDK 자체 재시도는 끈다.
+        client = OpenAI(
+            api_key=self._backend.api_key,
+            base_url=self._backend.base_url,
+            max_retries=0,
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+        )
+        logger.info(
+            "[ReportGenerator] LLM 클라이언트 초기화 완료 (%s / %s)",
+            self._backend.provider, self._model,
+        )
+        return client
 
     # ── 공개 인터페이스 ───────────────────────────────────────────────────────
 
@@ -112,21 +216,29 @@ class ReportGenerator:
         result_dict = research_result.model_dump(mode="json")
         user_prompt = build_analysis_prompt(result_dict)
 
-        if self._use_llm and self._client:
+        if self._client is not None:
             try:
                 report_md = self._call_llm_with_retry(SYSTEM_PROMPT, user_prompt)
                 logger.info("[ReportGenerator] LLM 리포트 생성 완료: %s", company_name)
                 return self._wrap_with_header(report_md, research_result)
             except Exception as exc:
+                reason = str(exc) if isinstance(exc, LLMCallError) else self._describe_error(exc)
                 logger.error(
-                    "[ReportGenerator] LLM 리포트 생성 최종 실패: %s - %s", company_name, exc
+                    "[ReportGenerator] LLM 리포트 생성 최종 실패: %s - %s", company_name, reason
                 )
-                # 앱 전체가 죽지 않도록 에러 메시지를 Markdown으로 반환
-                fallback = self._generate_fallback_report(research_result)
-                return fallback + f"\n\n> **[시스템 오류]** LLM API 호출 실패: `{exc}`\n"
+                # 앱 전체가 죽지 않도록 Fallback 리포트에 실패 원인을 남겨 반환
+                fallback = self._generate_fallback_report(
+                    research_result, reason=f"LLM 호출 실패 ({self.engine_label})"
+                )
+                return (
+                    fallback
+                    + f"\n\n> **[시스템 오류]** LLM API 호출 실패 ({self.engine_label}): {reason}\n"
+                )
         else:
-            # API 키 없음 → Fallback
-            report_md = self._generate_fallback_report(research_result)
+            # 사용 가능한 API 키 없음 → Fallback
+            report_md = self._generate_fallback_report(
+                research_result, reason=self._unavailable_reason
+            )
             logger.info("[ReportGenerator] Fallback 리포트 생성 완료: %s", company_name)
             return report_md
 
@@ -164,10 +276,10 @@ class ReportGenerator:
             str: LLM 응답 텍스트.
 
         Raises:
-            RuntimeError: 최대 재시도 횟수 초과 시.
+            LLMCallError: 재시도할 수 없는 에러이거나 최대 재시도 횟수 초과 시.
+                메시지에 실패 원인(HTTP 상태, 에러 코드, 조치 방법)을 담는다.
         """
         max_attempts = self._settings.max_retry_attempts
-        last_exc: Exception | None = None
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -177,21 +289,116 @@ class ReportGenerator:
                 return result
 
             except Exception as exc:
-                last_exc = exc
+                reason = self._describe_error(exc)
+                if not self._is_retryable(exc):
+                    logger.error(
+                        "[ReportGenerator] LLM 호출 실패 (재시도 불가): %s", reason
+                    )
+                    raise LLMCallError(f"{reason} — 재시도하지 않음") from exc
+
+                if attempt == max_attempts:
+                    logger.error(
+                        "[ReportGenerator] LLM 호출 실패 (%d/%d): %s", attempt, max_attempts, reason
+                    )
+                    raise LLMCallError(
+                        f"{reason} — 최대 재시도({max_attempts}회) 초과"
+                    ) from exc
+
                 wait = self._settings.retry_delay_seconds * attempt
                 logger.warning(
                     "[ReportGenerator] LLM 호출 실패 (%d/%d): %s - %.1f초 후 재시도",
-                    attempt, max_attempts, exc, wait,
+                    attempt, max_attempts, reason, wait,
                 )
-                if attempt < max_attempts:
-                    time.sleep(wait)
+                time.sleep(wait)
 
-        raise RuntimeError(
-            f"LLM API 최대 재시도({max_attempts}회) 초과"
-        ) from last_exc
+        raise LLMCallError("LLM 호출이 한 번도 시도되지 않았습니다 (MAX_RETRY_ATTEMPTS 확인)")
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        """다시 시도하면 성공할 가능성이 있는 에러인지 판단한다."""
+        import openai  # type: ignore[import]
+
+        if isinstance(exc, openai.RateLimitError):
+            # 쿼터 소진(insufficient_quota)은 기다려도 풀리지 않는다.
+            return ReportGenerator._error_code(exc) != "insufficient_quota"
+        if isinstance(exc, openai.APIStatusError):
+            # 5xx, 408(타임아웃), 409(충돌)만 재시도. 401/403/404/400/422 등은 즉시 중단.
+            return exc.status_code >= 500 or exc.status_code in (408, 409)
+        # 네트워크 오류, 타임아웃, 빈 응답 등
+        return True
+
+    @staticmethod
+    def _error_body(exc: Exception) -> dict:
+        """에러 본문의 error 객체를 꺼낸다. Gemini는 본문을 [{"error": {...}}] 목록으로 준다."""
+        body = getattr(exc, "body", None)
+        if isinstance(body, list) and body:
+            body = body[0]
+        if isinstance(body, dict):
+            err = body.get("error", body)
+            if isinstance(err, dict):
+                return err
+        return {}
+
+    @staticmethod
+    def _error_code(exc: Exception) -> Optional[str]:
+        """에러 본문에서 에러 코드를 꺼낸다 (OpenAI: code 문자열, Gemini: status 문자열)."""
+        err = ReportGenerator._error_body(exc)
+        for field in ("code", "status"):
+            value = err.get(field)
+            if isinstance(value, str) and value:
+                return value
+        code = getattr(exc, "code", None)
+        return str(code) if code is not None else None
+
+    @staticmethod
+    def _is_auth_error(exc: Exception) -> bool:
+        """인증 실패인지 판단한다. Gemini는 잘못된 키에 401 대신 400을 반환한다."""
+        import openai  # type: ignore[import]
+
+        if isinstance(exc, openai.AuthenticationError):
+            return True
+        if isinstance(exc, openai.BadRequestError):
+            message = str(ReportGenerator._error_body(exc).get("message", ""))
+            return "api key" in message.lower()
+        return False
+
+    def _describe_error(self, exc: Exception) -> str:
+        """에러를 원인과 조치 방법이 담긴 한 줄 메시지로 바꾼다. API 키는 포함하지 않는다."""
+        import openai  # type: ignore[import]
+
+        key_env = _PROVIDERS[self._backend.provider]["key_env"] if self._backend.provider else "API 키"
+        if isinstance(exc, openai.APIStatusError):
+            status = exc.status_code
+            code = self._error_code(exc)
+            head = f"HTTP {status} {type(exc).__name__}" + (f" ({code})" if code else "")
+            if self._is_auth_error(exc):
+                return f"{head}: API 키가 유효하지 않습니다. {key_env} 값을 확인하세요."
+            if status == 403:
+                return f"{head}: 이 API 키로 접근 권한이 없습니다. 키의 프로젝트/권한 설정을 확인하세요."
+            if status == 404:
+                return f"{head}: 모델 '{self._model}'을(를) 찾을 수 없습니다. LLM_MODEL 값을 확인하세요."
+            if code == "insufficient_quota":
+                return f"{head}: API 사용 한도(크레딧)가 소진되었습니다. 결제/요금제를 확인하세요."
+            if status == 429:
+                return f"{head}: 요청 속도 제한에 걸렸습니다."
+            if status >= 500:
+                return f"{head}: LLM 서버 일시 오류입니다."
+            detail = self._error_body(exc).get("message") or getattr(exc, "message", str(exc))
+            return f"{head}: {self._redact(str(detail))}"
+        if isinstance(exc, openai.APITimeoutError):
+            return "요청 시간 초과 (APITimeoutError)"
+        if isinstance(exc, openai.APIConnectionError):
+            return "LLM 서버에 연결하지 못했습니다 (APIConnectionError). 네트워크를 확인하세요."
+        return f"{type(exc).__name__}: {self._redact(str(exc))}"
+
+    def _redact(self, text: str, limit: int = 300) -> str:
+        """에러 메시지에서 API 키로 보이는 문자열을 가리고 길이를 제한한다."""
+        if self._backend.api_key:
+            text = text.replace(self._backend.api_key, "[REDACTED]")
+        return _KEY_PATTERN.sub("[REDACTED]", text)[:limit]
 
     def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
-        """OpenAI Chat Completions API를 호출하여 응답 텍스트를 반환한다.
+        """Chat Completions API(OpenAI 또는 Gemini 호환)를 호출하여 응답 텍스트를 반환한다.
 
         Args:
             system_prompt: 시스템 역할 지시 프롬프트.
@@ -203,6 +410,10 @@ class ReportGenerator:
         Raises:
             Exception: API 호출 실패 시 (재시도 로직이 처리).
         """
+        extra: dict[str, Any] = {}
+        if self._reasoning_effort:
+            extra["reasoning_effort"] = self._reasoning_effort
+
         response = self._client.chat.completions.create(
             model=self._model,
             messages=[
@@ -211,10 +422,25 @@ class ReportGenerator:
             ],
             max_tokens=self._max_tokens,
             temperature=self._temperature,
+            **extra,
         )
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
         if not content:
-            raise ValueError("LLM이 빈 응답을 반환했습니다.")
+            raise ValueError(
+                f"LLM이 빈 응답을 반환했습니다 (finish_reason={choice.finish_reason})."
+            )
+        if choice.finish_reason == "length":
+            # 추론 모델은 내부 추론 토큰도 max_tokens를 함께 쓰므로 본문이 잘릴 수 있다.
+            logger.warning(
+                "[ReportGenerator] 응답이 토큰 한도(LLM_MAX_TOKENS=%d)에서 잘렸습니다. "
+                "LLM_MAX_TOKENS를 늘리거나 LLM_REASONING_EFFORT=low를 설정하세요.",
+                self._max_tokens,
+            )
+            content += (
+                f"\n\n> **[주의]** 응답이 토큰 한도(LLM_MAX_TOKENS={self._max_tokens})에서 "
+                "잘려 리포트 끝부분이 누락되었을 수 있습니다.\n"
+            )
         return content.strip()
 
     def _count_tokens(self, text: str) -> int:
@@ -238,11 +464,12 @@ class ReportGenerator:
 
     # ── Fallback 리포트 생성 (LLM 없이) ──────────────────────────────────────
 
-    def _generate_fallback_report(self, result: ResearchResult) -> str:
+    def _generate_fallback_report(self, result: ResearchResult, reason: str = "") -> str:
         """LLM 없이 수집 데이터만으로 구조화된 Markdown 리포트를 생성한다.
 
         Args:
             result: 리서치 엔진 분석 결과.
+            reason: LLM을 사용하지 못한 사유 (리포트 상단에 표시).
 
         Returns:
             str: Fallback Markdown 리포트.
@@ -254,7 +481,9 @@ class ReportGenerator:
         lines: list[str] = [
             f"# {company} {ticker} 기업 분석 리포트",
             f"\n> 분석 기준일: {now} | 데이터 신뢰도: {format_confidence_10(result.overall_confidence_score)}",
-            "> **[Fallback 모드]** LLM API 미연동 - 수집 데이터 기반 구조화 리포트입니다.\n",
+            "> **[Fallback 모드]** LLM 미사용 - 수집 데이터 기반 구조화 리포트입니다."
+            + (f" (사유: {reason})" if reason else "")
+            + "\n",
         ]
 
         if result.data_quality_notes:
@@ -386,7 +615,7 @@ class ReportGenerator:
             f"# {company} {ticker} 기업 분석 리포트\n\n"
             f"> 분석 기준일: {now} | "
             f"데이터 신뢰도: {format_confidence_10(result.overall_confidence_score)} | "
-            f"생성 엔진: {self._model}\n\n"
+            f"생성 엔진: {self.engine_label}\n\n"
         )
         return header + markdown
 
@@ -520,7 +749,7 @@ if __name__ == "__main__":
 
     # ── 테스트 1: Fallback 리포트 (API 키 없이) ────────────────────────────────
     print("\n[테스트 1] Fallback 리포트 생성 (API 키 없이)\n")
-    settings_no_key = _Settings(dart_api_key="mock", openai_api_key="")
+    settings_no_key = _Settings(dart_api_key="mock", openai_api_key="", gemini_api_key="")
     generator = ReportGenerator(settings=settings_no_key)
 
     try:
