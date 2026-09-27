@@ -49,6 +49,9 @@ class ConsensusOpinion(BaseModel):
     hold_count: int = Field(default=0, description="보유(HOLD/NEUTRAL) 의견 수")
     sell_count: int = Field(default=0, description="매도(SELL/UNDERPERFORM) 의견 수")
     total_report_count: int = Field(default=0, description="분석에 사용된 리포트 총 수")
+    brokerage_count: int = Field(
+        default=0, description="의견·목표주가 집계에 쓴 증권사 수 (증권사별 최신 리포트 1건씩)"
+    )
     avg_target_price: Optional[float] = Field(None, description="평균 목표주가 (원)")
     max_target_price: Optional[float] = Field(None, description="최고 목표주가 (원)")
     min_target_price: Optional[float] = Field(None, description="최저 목표주가 (원)")

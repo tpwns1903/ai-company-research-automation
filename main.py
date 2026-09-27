@@ -81,10 +81,27 @@ def run_pipeline(
     except Exception as exc:
         logger.warning("[1단계] DART 수집 실패 (계속 진행): %s", exc)
 
-    # 주가 데이터 수집 (KRX)
+    # 전년도 재무 (YoY 성장률 계산용)
+    previous_financials = None
+    if raw_financials and raw_financials.fiscal_year:
+        try:
+            previous_financials = dart_collector.get_financials(
+                company_name, fiscal_year=raw_financials.fiscal_year - 1
+            )
+            logger.info(
+                "[1단계] DART 전년도(%d) 재무 수집 완료: 매출 %s 억원",
+                previous_financials.fiscal_year, previous_financials.revenue,
+            )
+        except Exception as exc:
+            logger.warning("[1단계] DART 전년도 재무 수집 실패 (YoY 생략): %s", exc)
+
+    # 주가 데이터 수집 (KRX). 종목 코드는 DART 조회 결과를 우선 사용한다.
     price_data = None
     try:
-        price_data = krx_collector.get_price_data(company_name)
+        price_data = krx_collector.get_price_data(
+            company_name,
+            stock_code=raw_financials.stock_code if raw_financials else None,
+        )
         logger.info("[1단계] KRX 시세 수집 완료: 종가 %s원", price_data.close_price)
     except Exception as exc:
         logger.warning("[1단계] KRX 수집 실패 (계속 진행): %s", exc)
@@ -130,6 +147,7 @@ def run_pipeline(
         try:
             processed_financials = financial_processor.process(
                 current=raw_financials,
+                previous=previous_financials,
                 price_metrics=price_data,
             )
             logger.info(

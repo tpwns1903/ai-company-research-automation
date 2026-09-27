@@ -259,25 +259,36 @@ class ResearchEngine:
         return risks[:5]
 
     def _build_consensus(self, reports: list[ReportItem]) -> Optional[ConsensusOpinion]:
-        """증권사 리포트들로부터 투자의견 및 목표주가 컨센서스를 계산한다."""
+        """증권사 리포트들로부터 투자의견 및 목표주가 컨센서스를 계산한다.
+
+        같은 증권사가 여러 번 낸 리포트(텔레그램 재배포, 목표가 변경 전후 등)를
+        모두 세면 한 증권사 의견이 과대 반영되고 변경 전 목표가가 섞인다.
+        그래서 증권사별로 가장 최근 리포트의 투자의견과 목표주가 하나씩만 집계한다.
+        """
         if not reports:
             return None
+
+        latest_opinion: dict[str, InvestmentOpinion] = {}
+        latest_target: dict[str, float] = {}
+        for r in sorted(reports, key=lambda x: x.published_at):  # 오래된 것 → 최신 순으로 덮어쓰기
+            broker = (r.brokerage or "미상").strip()
+            if r.opinion != InvestmentOpinion.NOT_RATED:
+                latest_opinion[broker] = r.opinion
+            if r.target_price and r.target_price > 0:
+                latest_target[broker] = r.target_price
 
         buy_count = 0
         hold_count = 0
         sell_count = 0
-        target_prices: list[float] = []
-
-        for r in reports:
-            if r.opinion in (InvestmentOpinion.BUY, InvestmentOpinion.STRONG_BUY):
+        for opinion in latest_opinion.values():
+            if opinion in (InvestmentOpinion.BUY, InvestmentOpinion.STRONG_BUY):
                 buy_count += 1
-            elif r.opinion in (InvestmentOpinion.HOLD, InvestmentOpinion.NEUTRAL):
+            elif opinion in (InvestmentOpinion.HOLD, InvestmentOpinion.NEUTRAL):
                 hold_count += 1
-            elif r.opinion in (InvestmentOpinion.SELL, InvestmentOpinion.UNDERPERFORM):
+            elif opinion in (InvestmentOpinion.SELL, InvestmentOpinion.UNDERPERFORM):
                 sell_count += 1
 
-            if r.target_price and r.target_price > 0:
-                target_prices.append(r.target_price)
+        target_prices: list[float] = list(latest_target.values())
 
         total_reports = len(reports)
         if buy_count >= hold_count and buy_count >= sell_count:
@@ -297,6 +308,7 @@ class ResearchEngine:
             hold_count=hold_count,
             sell_count=sell_count,
             total_report_count=total_reports,
+            brokerage_count=len(set(latest_opinion) | set(latest_target)),
             avg_target_price=avg_tp,
             max_target_price=max_tp,
             min_target_price=min_tp,

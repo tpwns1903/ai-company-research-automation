@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     telegram_api_id: str = Field(default="", description="Telegram API ID")
     telegram_api_hash: str = Field(default="", description="Telegram API Hash")
     telegram_phone: str = Field(default="", description="Telegram 계정 전화번호")
+    krx_id: str = Field(default="", description="KRX 데이터 포털 ID (pykrx 1.2.8+ 펀더멘털 조회용)")
+    krx_pw: str = Field(default="", description="KRX 데이터 포털 비밀번호")
 
     # ── 수집 설정 ───────────────────────────────────────────────
     report_lookback_days: int = Field(

@@ -122,6 +122,7 @@ class ExcelExporter:
             rows += [
                 ("컨센서스 투자의견", c.dominant_opinion.value),
                 ("매수 / 중립 / 매도", f"{c.buy_count} / {c.hold_count} / {c.sell_count}"),
+                ("집계 증권사 수 (증권사별 최신 리포트)", c.brokerage_count),
                 ("총 리포트 수", c.total_report_count),
                 ("평균 목표주가", f"{c.avg_target_price:,.0f}원" if c.avg_target_price else "N/A"),
                 ("목표주가 범위", f"{c.min_target_price:,.0f} ~ {c.max_target_price:,.0f}원"

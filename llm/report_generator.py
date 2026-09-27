@@ -531,7 +531,8 @@ class ReportGenerator:
         if result.consensus and result.source_reports:
             c = result.consensus
             lines.append(f"- 대표 의견: **{c.dominant_opinion.value}**")
-            lines.append(f"- 의견 분포: 매수 {c.buy_count}건 / 중립 {c.hold_count}건 / 매도 {c.sell_count}건")
+            lines.append(f"- 집계 기준: 증권사 {c.brokerage_count}곳의 최신 리포트 (수집 리포트 {c.total_report_count}건)")
+            lines.append(f"- 의견 분포: 매수 {c.buy_count}곳 / 중립 {c.hold_count}곳 / 매도 {c.sell_count}곳")
             if c.avg_target_price:
                 lines.append(f"- 평균 목표주가: **{c.avg_target_price:,.0f}원**")
         else:

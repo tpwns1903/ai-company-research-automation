@@ -119,7 +119,7 @@ def render_consensus_and_points(r: Any) -> None:
         if r.consensus and r.source_reports:
             c = r.consensus
             st.metric("투자의견", c.dominant_opinion.value)
-            st.write(f"**매수/중립/매도**: {c.buy_count} / {c.hold_count} / {c.sell_count} (총 {c.total_report_count}건)")
+            st.write(f"**매수/중립/매도**: {c.buy_count} / {c.hold_count} / {c.sell_count} (증권사 {c.brokerage_count}곳 기준, 수집 리포트 {c.total_report_count}건)")
             if c.avg_target_price:
                 st.write(f"**평균 목표주가**: {c.avg_target_price:,.0f}원")
                 if c.min_target_price and c.max_target_price:

@@ -42,9 +42,9 @@ def format_won_uk(value_uk: Optional[float]) -> str:
     jo, uk = divmod(rounded, _UK_PER_JO)
 
     if jo and uk:
-        return f"{sign}{jo}조 {uk:,}억원"
+        return f"{sign}{jo:,}조 {uk:,}억원"
     if jo:
-        return f"{sign}{jo}조원"
+        return f"{sign}{jo:,}조원"
     return f"{sign}{uk:,}억원"
 
 

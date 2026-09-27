@@ -7,19 +7,85 @@ PyKRX 문서: https://github.com/sharebook-kr/pykrx
   - 일별 OHLCV (시가/고가/저가/종가/거래량)
   - 시가총액, 외국인 보유 비율
   - PER, PBR, EPS, BPS, 배당수익률
+
+pykrx 1.2.8부터 종목 목록·펀더멘털·시가총액 조회에 KRX 데이터 포털 로그인
+(KRX_ID / KRX_PW 환경변수)이 필요하다. 로그인 없이 빈 결과가 오면
+네이버 금융 종목 API로 PER/PBR/EPS/BPS/배당수익률/시가총액을 보충한다.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import re
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Optional, Protocol
+
+import requests
 
 from collectors.base_collector import BaseCollector, CollectorError
 from config.config import Settings
 from models.financial_metrics import FinancialMetrics, PriceMetrics
 
 logger = logging.getLogger(__name__)
+
+_NAVER_STOCK_API = "https://m.stock.naver.com/api/stock/{code}/integration"
+
+
+def _parse_naver_number(text: Optional[str]) -> Optional[float]:
+    """'12.85배', '22,292원', '0.58%' 같은 문자열에서 숫자를 꺼낸다. 'N/A'·'-'는 None."""
+    if not text:
+        return None
+    match = re.search(r"-?[\d,]+(?:\.\d+)?", text)
+    if not match:
+        return None
+    return float(match.group().replace(",", ""))
+
+
+def _parse_naver_market_cap_uk(text: Optional[str]) -> Optional[float]:
+    """'1,674조 9,588억' 형식의 시가총액을 억 원 단위 숫자로 바꾼다."""
+    if not text:
+        return None
+    jo = re.search(r"([\d,]+)\s*조", text)
+    uk = re.search(r"([\d,]+)\s*억", text)
+    if not jo and not uk:
+        return None
+    total = 0.0
+    if jo:
+        total += float(jo.group(1).replace(",", "")) * 10_000
+    if uk:
+        total += float(uk.group(1).replace(",", ""))
+    return total
+
+
+def fetch_naver_valuation(stock_code: str, timeout: float = 10.0) -> dict[str, Optional[float]]:
+    """네이버 금융 종목 API에서 밸류에이션 지표를 조회한다 (로그인 불필요).
+
+    Args:
+        stock_code: 6자리 종목 코드.
+        timeout: 요청 타임아웃 (초).
+
+    Returns:
+        dict: per, pbr, eps, bps, dividend_yield (%), market_cap (억 원). 값이 없으면 None.
+
+    Raises:
+        requests.RequestException: 네트워크/HTTP 오류.
+    """
+    resp = requests.get(
+        _NAVER_STOCK_API.format(code=stock_code),
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    infos = {item.get("code"): item.get("value") for item in resp.json().get("totalInfos", [])}
+    return {
+        "per": _parse_naver_number(infos.get("per")),
+        "pbr": _parse_naver_number(infos.get("pbr")),
+        "eps": _parse_naver_number(infos.get("eps")),
+        "bps": _parse_naver_number(infos.get("bps")),
+        "dividend_yield": _parse_naver_number(infos.get("dividendYieldRatio")),
+        "market_cap": _parse_naver_market_cap_uk(infos.get("marketValue")),
+    }
 
 
 # ── PyKRX 어댑터 프로토콜 (Mock 주입용) ──────────────────────────────────────
@@ -68,7 +134,12 @@ class KrxAdapter(Protocol):
 class _PykrxAdapter:
     """실제 pykrx 라이브러리를 KrxAdapter 프로토콜에 맞게 감싸는 어댑터."""
 
-    def __init__(self) -> None:
+    def __init__(self, krx_id: str = "", krx_pw: str = "") -> None:
+        # pykrx는 import 시점에 os.getenv("KRX_ID"/"KRX_PW")로 로그인 정보를 읽으므로
+        # .env(Settings)에 있는 값을 import 전에 환경변수로 넘긴다. 이미 설정된 값은 유지.
+        if krx_id and krx_pw:
+            os.environ.setdefault("KRX_ID", krx_id)
+            os.environ.setdefault("KRX_PW", krx_pw)
         try:
             from pykrx import stock as _stock  # type: ignore[import]
             self._stock = _stock
@@ -132,15 +203,21 @@ class KrxCollector(BaseCollector):
         self,
         settings: Optional[Settings] = None,
         krx_adapter: Optional[KrxAdapter] = None,
+        valuation_fetcher: Optional[Callable[[str], dict[str, Optional[float]]]] = None,
     ) -> None:
         """KrxCollector를 초기화한다.
 
         Args:
             settings: 애플리케이션 설정. None이면 .env에서 자동 로드.
             krx_adapter: PyKRX 어댑터 (테스트 시 Mock 주입용).
+            valuation_fetcher: pykrx 지표가 비었을 때 쓰는 보충 조회 함수
+                (기본: 네이버 금융, 테스트 시 Mock 주입용).
         """
         super().__init__(settings)
-        self._krx: KrxAdapter = krx_adapter or _PykrxAdapter()
+        self._krx: KrxAdapter = krx_adapter or _PykrxAdapter(
+            self._settings.krx_id, self._settings.krx_pw
+        )
+        self._valuation_fetcher = valuation_fetcher or fetch_naver_valuation
         self._ticker_cache: dict[str, str] = {}  # company_name → ticker (인메모리 캐시)
         logger.debug("KrxCollector 준비 완료")
 
@@ -167,12 +244,15 @@ class KrxCollector(BaseCollector):
         self,
         company_name: str,
         trade_date: Optional[date] = None,
+        stock_code: Optional[str] = None,
     ) -> PriceMetrics:
         """특정 날짜의 주가 및 투자지표를 반환한다.
 
         Args:
             company_name: 기업명.
             trade_date: 조회 기준일. None이면 전 영업일.
+            stock_code: 종목 코드를 이미 알고 있으면 지정 (예: DART 조회 결과).
+                지정하면 KRX 종목 목록 조회(로그인 필요)를 건너뛴다.
 
         Returns:
             PriceMetrics: 정규화된 주가 데이터.
@@ -191,6 +271,8 @@ class KrxCollector(BaseCollector):
         logger.info("[KRX] API 수집 시작: %s (%s)", company_name, target_date)
 
         # 종목 코드 조회
+        if stock_code:
+            self._ticker_cache[company_name] = stock_code
         ticker = self._request_with_retry(self.get_stock_code, company_name)
 
         # 주가/펀더멘털/시가총액 병렬 수집
@@ -222,6 +304,7 @@ class KrxCollector(BaseCollector):
             cap_df=cap_df,
             target_date=target_date,
         )
+        metrics = self._fill_missing_valuation(metrics)
 
         self._save_cache(cache_key, metrics.model_dump(mode="json"))
         logger.info(
@@ -294,6 +377,30 @@ class KrxCollector(BaseCollector):
         raise CollectorError(f"[KRX] 종목을 찾을 수 없음: '{company_name}'")
 
     # ── 내부 파싱 ─────────────────────────────────────────────────────────────
+
+    def _fill_missing_valuation(self, metrics: PriceMetrics) -> PriceMetrics:
+        """pykrx에서 비어 온 밸류에이션 지표를 보충 조회 함수(네이버 금융)로 채운다."""
+        fields = ("per", "pbr", "eps", "bps", "dividend_yield", "market_cap")
+        missing = [f for f in fields if getattr(metrics, f) is None]
+        if not missing:
+            return metrics
+
+        try:
+            self._wait()
+            fetched = self._valuation_fetcher(metrics.stock_code)
+        except Exception as exc:
+            logger.warning(
+                "[KRX] 밸류에이션 보충 조회 실패 (%s): %s — %s 비어 있음",
+                metrics.stock_code, exc, ", ".join(missing),
+            )
+            return metrics
+
+        filled = {f: fetched[f] for f in missing if fetched.get(f) is not None}
+        if filled:
+            logger.info(
+                "[KRX] pykrx에 없는 지표를 네이버 금융으로 보충: %s", ", ".join(filled)
+            )
+        return metrics.model_copy(update=filled)
 
     def _parse_market_data(
         self,
