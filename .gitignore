@@ -1,0 +1,53 @@
+# ============================================================
+# .gitignore — Git 추적 제외 파일/폴더 목록
+# ============================================================
+
+# 환경변수 (절대 커밋 금지!)
+.env
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 로컬 캐시 (24시간 캐시 데이터)
+cache/
+
+# 텔레그램 로그인 세션 (개인 계정 인증 정보 포함, 절대 커밋 금지!)
+*.session
+*.session-journal
+
+# 생성된 리포트 출력물
+output/reports/
+output/report_pdfs/
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+
+# OS 파일
+.DS_Store
+Thumbs.db
+
+# 테스트 커버리지
+.coverage
+htmlcov/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# 빌드
+dist/
+build/
+*.egg-info/
+
+# Claude Code 로컬 설정
+.claude/
