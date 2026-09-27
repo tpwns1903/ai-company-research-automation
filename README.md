@@ -90,14 +90,13 @@ streamlit run ui/streamlit_app.py
 
 ## 대시보드
 
-<!--
-대시보드 스크린샷 추가 방법:
-1. Streamlit 화면을 캡처해 docs/images/dashboard.png 로 저장
-2. 아래 줄의 주석 표시를 지우고 커밋
-![Streamlit 대시보드](docs/images/dashboard.png)
--->
+![Streamlit 대시보드 — AI 리포트 탭](docs/images/dashboard.png)
 
 `streamlit run ui/streamlit_app.py`로 실행합니다. 사이드바에 기업명을 입력하면 재무 지표, 증권사 컨센서스, 핵심 투자포인트·리스크, 뉴스 감성 요약을 탭으로 보여 주고, 리포트 파일(Markdown / Excel / PDF)을 내려받을 수 있습니다.
+
+| 투자 포인트 탭 | 뉴스 분석 탭 |
+|---|---|
+| ![투자 포인트 탭](docs/images/dashboard2.png) | ![뉴스 분석 탭](docs/images/dashboard3.png) |
 
 ## 샘플 리포트
 
